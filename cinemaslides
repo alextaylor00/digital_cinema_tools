@@ -89,6 +89,7 @@ require 'nokogiri'
 require 'highline/import'
 require 'pathname'
 require 'shellwords'
+require 'tzinfo'
 
 
 # FIXME catch missing parameters, false options, typos etc.
@@ -125,7 +126,7 @@ class Optparser
     options.issuer = ENV[ 'USER' ] + '@' + `hostname`.chomp
     options.tkr_base_url = NIL
     options.cma = NIL
-    options.annotation = "#{ AppName } " + DateTime.now.to_s
+    #options.annotation = "#{ AppName } " + DateTime.now.to_s
     options.dcp_package_type = 'OV'
     options.dcp_package_type_choices = [ 'ov', 'vf', Regexp.new( /vf\d+/i ) ] # keep regexp choices at the end of these lists
     options.dcp_kind = 'test'
@@ -138,7 +139,15 @@ class Optparser
     options.encrypt_headers = TRUE
     options.sign = FALSE
     options.kdm = FALSE
-    options.kdm_formulation = 'dci-specific'
+	
+	# alex customized these options
+	options.annotation = ""
+	options.kdm_dkdm = NIL
+    options.kdm_formulation = 'modified-transitional-1'
+	options.kdm_zone = 'UTC' # of the form 'America/Vancouver', 'America/New_York', etc. Default UTC
+	
+	# / end customization
+	
     options.kdm_formulation_choices = [ 'dci-specific', 'dci-any', 'modified-transitional-1', 'transitional-1', 'ds', 'da', 'mt1', 't1' ]
     options.kdm_cpl = NIL
     options.kdm_cpl_id = NIL
@@ -173,7 +182,7 @@ Usage:
              [-o, --dcp-out <path>]
              [--keep] [--wrap-stereoscopic] [-m, --montagepreview] [--mg, --mplayer-gamma <gamma>]
              [--sign] [--encrypt] [--dont-encrypt-headers]
-             [--kdm] [--formulation <KDM formulation>] [--cpl <cpl file>] [--cpl-id <CPL UUID>] [ --cpl-content-title <text> ] [--keysdir <directory with referenced keys>]
+             [--kdm] [--dkdm <DKDM file>] [--formulation <KDM formulation>] [--cpl <cpl file>] [--cpl-id <CPL UUID>] [ --cpl-content-title <text> ] [--keysdir <directory with referenced keys>]
                [--start <days from now>|<datetime>] [--end <days from now>|<datetime>] [--target <certificate>]
              [--tkr-base-url <url>] [--cma <CompositionMetadataAsset data>]
              [-v, --verbosity <level>] [--examples] [-h, --help]
@@ -314,7 +323,10 @@ BANNER
       opts.on( '--kdm', 'KDM mode: Generate key delivery message. Use with --cpl or --cpl-id, --start, --end, --issuer and --target' ) do
         options.kdm = TRUE
       end
-      opts.on( '-f', '--formulation formulation', String, "Use dci-specific, dci-any, modified-transitional-1, transitional-1 or the respective acronyms (Default: dci-specific | ds)" ) do |p|
+      opts.on( '--dkdm file', 'KDM mode: Specify DKDM file (the KDM targeted at cinemaslides containing the keys you wish to use for thew new KDM' ) do |p|
+        options.kdm_dkdm = p
+      end
+      opts.on( '-f', '--formulation formulation', String, "Use dci-specific, dci-any, modified-transitional-1, transitional-1 or the respective acronyms (Default: modified-transitional-1 | mt1)" ) do |p|
         if options.kdm_formulation_choices.include?( p.downcase )
           options.kdm_formulation = p.downcase
         end
@@ -336,6 +348,9 @@ BANNER
       end
       opts.on( '--end days', String, 'KDM mode: KDM validity ends <days> from now or at <datetime> (Default: 4 weeks from now)' ) do |p|
         options.kdm_end = p
+      end
+      opts.on( '--zone timezone', String, 'KDM mode: Time zone for the dates specified in start and end (Default: UTC)' ) do |p|
+        options.kdm_zone = p
       end
       opts.on( '--target certificate', String, 'KDM mode: Path to the recipient device certificate' ) do |p|
         options.kdm_target = p
@@ -448,6 +463,86 @@ ARGV.each do |arg|
 end
 # destructive parse
 options = Optparser.parse( ARGV )
+
+# (alex) KDM Cipher
+class KDMCipher
+  attr_reader :plaintext, :type
+  def initialize( cipher_b64, pkey )
+    @plaintext = Hash.new
+    begin
+      decrypted_blob = pkey.private_decrypt( Base64.decode64( cipher_b64 ), OpenSSL::PKey::RSA::PKCS1_OAEP_PADDING )
+    rescue Exception => e
+      puts "#{ e.inspect }. Wrong RSA private key?"
+      return nil
+    end
+
+    case decrypted_blob.size
+    when 134
+      @type = :interop
+      template = [
+        [:structure_id,       16],
+        [:signer_thumbprint,  20],
+        [:cpl_id,             16],
+        [:key_id,             16],
+        [:not_valid_before,   25],
+        [:not_valid_after,    25],
+        [:key_data,           16]
+      ]
+    when 138
+      @type = :smpte
+      template = [
+        [:structure_id,       16],
+        [:signer_thumbprint,  20],
+        [:cpl_id,             16],
+        [:key_type,            4],
+        [:key_id,             16],
+        [:not_valid_before,   25],
+        [:not_valid_after,    25],
+        [:key_data,           16]
+      ]
+    else
+      raise "#{ decrypted_blob.size } bytes: Plaintext package size does not match Interop or SMPTE specs"
+    end
+
+    pos = 0
+    template.each.map do |field, length|
+      blob = decrypted_blob[ pos .. pos + length - 1 ]
+      @plaintext[ field ] = self.send( field, blob )
+      pos += length
+    end
+  end
+
+  def structure_id( blob )      blob.unpack( 'H2' * 16 ).join         end
+  def signer_thumbprint( blob ) Base64::encode64( blob ).chomp        end
+  def cpl_id( blob )            to_uuid_rep blob.unpack( 'H*' ).first end
+  def key_type( blob )          blob                                  end
+  def key_id( blob )            to_uuid_rep blob.unpack( 'H*' ).first end
+  def not_valid_before( blob )  blob                                  end
+  def not_valid_after( blob )   blob                                  end
+  def key_data( blob )          blob.unpack( 'H2' * 16 ).join         end
+
+  def to_uuid_rep( h )
+    [ h[ 0 .. 7 ], h[ 8 .. 11 ], h[ 12 .. 15 ], h[ 16 .. 19 ], h[ 20 .. 31 ] ].join( '-' )
+  end
+
+  def plaintext_key_id
+    @plaintext[ :key_id ]
+  end
+
+  def plaintext_key_data
+    @plaintext[ :key_data ]
+  end
+
+  def plaintext_key_type
+    @plaintext[ :key_type ]
+  end
+
+end # / KDMCipher
+
+kdm_types = {
+  :smpte => KDM_SMPTE = "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type",
+  :interop => KDM_INTEROP = "http://www.digicine.com/PROTO-ASDCP-KDM-20040311#"
+}
 
 
 module OS
@@ -1822,6 +1917,14 @@ def yyyymmdd( datetime ) # used in KDM filenames. See http://www.kdmnamingconven
   datetime.to_s.split('T').first.gsub( /-/,'' )
 end
 
+# (alex) zoneinfo helper
+def add_utc_offset (time, zone)
+  # this works by taking whatever time is given in the variable 'time',
+  # assuming it's local to the timezone specified in 'zone,' and
+  # converts it to UTC (so the offset given by this will always be +00:00)
+  zone.local_to_utc(DateTime.parse(time))
+end
+
 
 def dc_thumbprint( cert_file )
   tmp = Tempfile.new( 'cinemaslides-' )
@@ -1933,6 +2036,65 @@ if options.kdm == TRUE
     end
   end
   
+
+  # (alex) decrypt KDM
+
+  if options.kdm_dkdm
+    @logger.info ( "DKDM present, decrypting key data..." )
+    begin
+      xml = Nokogiri::XML( open options.kdm_dkdm )
+      pkey = OpenSSL::PKey::RSA.new( File.open signer_key_file )
+    rescue Exception => e
+      @logger.info ( "Error opening DKDM for decryption: " + e.message )
+      exit 1
+    end
+
+    message = 'DCinemaSecurityMessage'
+
+    # either this or, rather, schema check
+    # root.node_name will be nil for non-xml
+    if xml.root.node_name != message
+      @logger.info ( 'Error decrypting DKDM: Not a DCinemaSecurityMessage' )
+      exit 1
+    else
+      xml.remove_namespaces!
+      message_id = xml.xpath( "//#{ message }/AuthenticatedPublic/MessageId" ).text.split( 'urn:uuid:' ).last
+      message_type = xml.xpath( "//#{ message }/AuthenticatedPublic/MessageType" ).text
+      cipher_values = xml.xpath( "//#{ message }/AuthenticatedPrivate/EncryptedKey/CipherData/CipherValue" )
+      case message_type
+      when kdm_types[ :smpte ]
+        type = :smpte
+      when kdm_types[ :interop ]
+        type = :interop
+      end
+
+      #puts "#{ type } KDM: #{ message }, ID: #{ message_id } (#{ message_type })"
+
+      kc = NIL
+      target_kdm_keys = Hash.new
+
+      cipher_values.each do |cvn|
+        cv = cvn.text
+        kc = KDMCipher.new( cv, pkey )
+        if kc
+          key_info = "#{ kc.plaintext_key_id }:#{ kc.plaintext_key_type }:#{ kc.plaintext_key_data}"
+          target_kdm_keys[kc.plaintext_key_id] = key_info
+
+        else
+          next
+        end
+      end
+
+      if target_kdm_keys.size < cipher_values.size
+        @logger.info ( "Error decrypting DKDM: Mismatched number of keys" )
+        exit 1
+      end
+
+    @logger.info ("Decrypted DKDM successfully! Found #{ target_kdm_keys.size } keys")
+
+    end
+    # (alex) we come out of this with target_kdm_keys to use instead of the keys dir, later on
+  end
   # check for key directory
   if options.kdm_keysdir
     @keysdir = options.kdm_keysdir
@@ -2026,20 +2188,50 @@ if options.kdm == TRUE
     keys = Array.new
     keys_missing = 0
     keys_invalid = 0
-    cpl_key_ids_types.each do |kit|
-      if File.exists?( File.join( @keysdir, kit.keys.first ) )
-        candidate_key = File.read( File.join( @keysdir, kit.keys.first ) )
-        if key_spec_valid?( candidate_key )
-          @logger.debug( "   Valid: #{ kit.keys.first }" )
-          keys << candidate_key
-        else
-          @logger.info( "Key file #{ kit.keys.first } doesn't fit specs: <UUID>:<Key type>:<Key>" )
-          keys_invalid += 1
-        end
-      else
-        @logger.info( "   Not found: #{ kit.keys.first }" )
-        keys_missing += 1
-      end
+		# (alex) branching this out to deal with either KEY DIRECTORY, or KEY ARRAY
+		if target_kdm_keys
+		  cpl_key_ids_types.each do |kit|
+
+			if target_kdm_keys.has_key?(kit.keys.first)
+			  candidate_key = target_kdm_keys[kit.keys.first]
+
+			  @logger.info ("Key found: #{ candidate_key }" )
+
+			  if key_spec_valid?( candidate_key )
+				@logger.debug( "   Valid: #{ kit.keys.first }" )
+				keys << candidate_key
+			  else
+				@logger.info( "Key file #{ kit.keys.first } doesn't fit specs: <UUID>:<Key type>:<Key>" )
+				keys_invalid += 1
+			  end
+			else
+
+
+			  @logger.info( "   Not found: #{ kit.keys.first }" )
+			  keys_missing += 1
+			end
+
+
+
+		  end
+
+		else
+		  # proceed as normal
+		cpl_key_ids_types.each do |kit|
+		  if File.exists?( File.join( @keysdir, kit.keys.first ) )
+			candidate_key = File.read( File.join( @keysdir, kit.keys.first ) )
+			if key_spec_valid?( candidate_key )
+			  @logger.debug( "   Valid: #{ kit.keys.first }" )
+			  keys << candidate_key
+			else
+			  @logger.info( "Key file #{ kit.keys.first } doesn't fit specs: <UUID>:<Key type>:<Key>" )
+			  keys_invalid += 1
+			end
+		  else
+			@logger.info( "   Not found: #{ kit.keys.first }" )
+			keys_missing += 1
+		  end
+		end # / target_kdm_keys
     end
     if keys_missing > 0
       @logger.info( "Keys not found: #{ keys_missing }/#{ cpl_key_ids_types.size }" )
@@ -2056,9 +2248,23 @@ if options.kdm == TRUE
 
   # check KDM time window
   # Exit on fail now (we need valid datetimes in later checks)
+# (Alex) added timezone check options
+  if options.kdm_zone
+    begin
+      tz = TZInfo::Timezone.get(options.kdm_zone)
+    rescue TZInfo::InvalidTimezoneIdentifier
+      puts "Option --zone: Invalid time zone specified."
+      exit 1
+    rescue Exception => e
+      puts "Option --zone: #{e.message}"
+      exit 1
+    end
+  end # / options.kdm_zone
   dt_re = /^\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\d(\+|-)\d\d:\d\d$/
+  dt_re_nozone = /^\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\d$/
   if options.kdm_start =~ /^\d+$/
-    kdm_not_valid_before = ( DateTime.now - 0.1 + options.kdm_start.to_i )
+	# (alex) removed the - 0.1 after DateTime.now for more accuracy
+    kdm_not_valid_before = ( DateTime.now + options.kdm_start.to_i )
   elsif options.kdm_start =~ dt_re
     begin
       kdm_not_valid_before = DateTime.parse options.kdm_start
@@ -2066,6 +2272,8 @@ if options.kdm == TRUE
       puts "Option --start: #{ e.message }"
       exit 1
     end
+  elsif options.kdm_start =~ dt_re_nozone
+      kdm_not_valid_before = add_utc_offset(options.kdm_start, tz)
   else
     puts "Option --start: Not valid. Use either days from now or datetime string"
     exit 1
@@ -2079,6 +2287,8 @@ if options.kdm == TRUE
       puts "Option --end: #{ e.message }"
       exit 1
     end
+  elsif options.kdm_end =~ dt_re_nozone
+    kdm_not_valid_after = add_utc_offset(options.kdm_end, tz)
   else
     puts "Option --end: Not valid. Use either days from now or datetime string"
     exit 1
@@ -2109,7 +2319,7 @@ if options.kdm == TRUE
         recipient_cert_obj = OpenSSL::X509::Certificate.new( File.read( options.kdm_target ) )
         @logger.debug( "Target: #{ recipient_cert_obj.inspect }" )
         recipient_cert_thumbprint = dc_thumbprint( options.kdm_target )
-        recipient_cn_name = 'TEST'
+        recipient_cn_name = 'CN' # (alex) was previously TEST
         # make target name for kdm filename and print RDN info
         @logger.debug( "Target:" )
         recipient_cert_obj.subject.to_a.each do |rdn|
@@ -2181,7 +2391,11 @@ if options.kdm == TRUE
   cipher_data_payloads = Array.new
   cpl_key_ids_types.each do |kit|
     # FIXME
-    key = File.read( File.join( @keysdir, kit.keys.first ) ).split( ':' ).last
+    if target_kdm_keys
+      key = target_kdm_keys[kit.keys.first].split( ':' ).last
+    else
+	  key = File.read( File.join( @keysdir, kit.keys.first ) ).split( ':' ).last
+	end
     key_id = kit.keys.first
     cipher_data_payload = cipher_data_payload_binary_package( 
       signer_cert_thumbprint,
@@ -2241,6 +2455,7 @@ if options.kdm == TRUE
     kdm_formulation_acronym = options.kdm_formulation.split( '-' ).map { |e| e[ 0 ] }.join
   end
   kdm_file = "kdm_#{ kdm_cpl_content_title }_#{ recipient_cn_name }_#{ yyyymmdd( kdm_not_valid_before ) }_#{ yyyymmdd( kdm_not_valid_after ) }_#{ kdm_creation_facility_code }_#{ options.dcp_package_type }_#{ kdm_formulation_acronym }_#{ kdm_message_uuid[0..7] }.xml"
+  
   if File.exists?( kdm_file )
     @logger.info( "KDM exists: #{ kdm_file }" )
     @logger.info( "4 bytes UUID collision: #{ kdm_message_uuid }. Not overwriting" )
